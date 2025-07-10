@@ -1,0 +1,51 @@
+# Example tmux workspace configuration
+
+session: dev-environment
+working_directory: ~/projects/my-app
+
+# Specify which window/pane should have focus when attaching
+focus:
+  window: code
+  pane: 0
+
+windows:
+  - name: code
+    command: nvim .
+    panes:
+      - command: echo "Main editor pane"
+      - split: vertical
+        size: 30 # Percentage of the window
+        command: ls -la
+
+  - name: server
+    # Absolute path example
+    directory: ~/projects/my-app/server
+    command: echo "Starting development server..."
+    panes:
+      - command: npm run dev
+      - split: horizontal
+        command: tail -f logs/dev.log
+
+  - name: api
+    # Relative path example (relative to working_directory)
+    directory: api
+    command: echo "API services"
+    panes:
+      - command: echo "Ready for API commands"
+
+  - name: terminal
+    panes:
+      - command: echo "Ready for commands"
+      - split: horizontal
+        size: 50
+        command: htop
+      - split: vertical
+        command: git status
+
+  - name: database
+    command: echo "Database utilities"
+    panes:
+      - command: echo "Ready for commands"
+      - split: horizontal
+        size: 50
+        command: redis-cli

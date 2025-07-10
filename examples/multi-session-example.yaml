@@ -1,0 +1,63 @@
+# Multi-session tmux workspace configuration
+
+# Define multiple sessions in a single config file
+sessions:
+  # First session - development environment
+  - session: dev
+    working_directory: ~/projects/my-app
+
+    focus:
+      window: code
+      pane: 0
+
+    windows:
+      - name: code
+        command: nvim .
+        panes:
+          - command: echo "Main editor pane"
+          - split: vertical
+            size: 30
+            command: ls -la
+
+      - name: server
+        command: npm run dev
+
+      - name: terminal
+        panes:
+          - command: echo "Development session ready"
+          - split: horizontal
+            command: git status
+
+  # Second session - database tools
+  - session: db
+    working_directory: ~/projects/my-app/database
+
+    windows:
+      - name: mongo
+        command: echo "MongoDB client"
+        panes:
+          - command: mongo
+
+      - name: redis
+        command: redis-cli
+
+      - name: logs
+        panes:
+          - command: tail -f db.log
+          - split: vertical
+            command: echo "Database monitoring"
+
+  # Third session - deployment tools
+  - session: deploy
+    working_directory: ~/projects/my-app
+
+    windows:
+      - name: docker
+        command: docker ps
+
+      - name: terraform
+        directory: ~/projects/my-app/infrastructure
+        command: terraform state list
+
+      - name: logs
+        command: echo "Deployment logs"

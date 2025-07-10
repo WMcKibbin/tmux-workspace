@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+
+import yaml
+import argparse
+import os
+import subprocess
+import sys
+import re
+from pathlib import Path
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Set up tmux workspaces from YAML configuration files")
+    parser.add_argument("config", help="Path to the YAML configuration file")
+    parser.add_argument("--session-name", "-s", help="Override the session name from the config file")
+    parser.add_argument("--session-index", "-i", type=int, help="Index of the session to create when config has multiple sessions")
+    parser.add_argument("--all-sessions", "-A", action="store_true", help="Create all sessions defined in the config")
+    parser.add_argument("--attach", "-a", action="store_true", help="Attach to the session after creating it (only works with single session)")
+    parser.add_argument("--debug", "-d", action="store_true", help="Show tmux commands without executing them")
+    return parser.parse_args()
+
+def load_config(config_path):
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading configuration file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def expand_path(path_str, base_dir=None):
+    """Expand environment variables and ~ in paths
+    If path is relative and base_dir is provided, make it relative to base_dir
+    """
+    if not path_str:
+        return None
+        
+    # Expand user and environment variables
+    expanded = os.path.expandvars(os.path.expanduser(path_str))
+    
+    # If it's an absolute path already or no base directory provided, return as is
+    if os.path.isabs(expanded) or not base_dir:
+        return expanded
+    
+    # Otherwise, join with the base directory
+    return os.path.join(base_dir, expanded)
+
+def run_tmux_command(command, debug=False):
+    """Run a tmux command"""
+    if debug:
+        print(f"[DEBUG] Would run: {command}")
+        return True
+    try:
+        subprocess.run(command, shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing tmux command: {e}", file=sys.stderr)
+        return False
+    return True
+
+def session_exists(session_name, debug=False):
+    """Check if a tmux session exists"""
+    if debug:
+        return False
+    try:
+        result = subprocess.run(
+            f"tmux has-session -t {session_name}",
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def create_layout(config, session_name, debug=False):
+    """Create the tmux session based on the configuration"""
+    # Handle working directory
+    working_dir = config.get('working_directory', '.')
+    if working_dir:
+        working_dir = expand_path(working_dir)
+        if not os.path.exists(working_dir):
+            print(f"Warning: Working directory '{working_dir}' does not exist.", file=sys.stderr)
+    
+    # Check if the session already exists
+    if session_exists(session_name, debug):
+        print(f"Session '{session_name}' already exists. Skipping.", file=sys.stderr)
+        return False
+    
+    # Create a new session with the first window
+    windows = config.get('windows', [])
+    if not windows:
+        print("No windows defined in configuration.", file=sys.stderr)
+        return False
+    
+    first_window = windows[0]
+    window_name = first_window.get('name', 'window1')
+    window_cmd = first_window.get('command', None)
+    
+    # Handle window-specific directory
+    window_dir = first_window.get('directory')
+    if window_dir:
+        window_dir = expand_path(window_dir, working_dir)
+    else:
+        window_dir = working_dir
+    
+    # Create the session with the first window
+    create_cmd = f"tmux new-session -d -s {session_name} -n {window_name}"
+    if window_dir:
+        create_cmd += f" -c {window_dir}"
+    
+    if not run_tmux_command(create_cmd, debug):
+        return False
+    
+    # Execute command in the first window if specified
+    if window_cmd:
+        if not run_tmux_command(f"tmux send-keys -t {session_name}:{window_name} '{window_cmd}' C-m", debug):
+            return False
+    
+    # Process panes for the first window
+    if 'panes' in first_window:
+        process_panes(session_name, window_name, first_window['panes'], window_dir, debug)
+    
+    # Process the rest of the windows
+    for i, window in enumerate(windows[1:], 1):
+        window_name = window.get('name', f'window{i+1}')
+        window_cmd = window.get('command', None)
+        
+        # Handle window-specific directory
+        window_dir = window.get('directory')
+        if window_dir:
+            window_dir = expand_path(window_dir, working_dir)
+        else:
+            window_dir = working_dir
+        
+        create_window_cmd = f"tmux new-window -t {session_name} -n {window_name}"
+        if window_dir:
+            create_window_cmd += f" -c {window_dir}"
+        
+        if not run_tmux_command(create_window_cmd, debug):
+            return False
+        
+        if window_cmd:
+            if not run_tmux_command(f"tmux send-keys -t {session_name}:{window_name} '{window_cmd}' C-m", debug):
+                return False
+        
+        # Process panes for this window
+        if 'panes' in window:
+            process_panes(session_name, window_name, window['panes'], window_dir, debug)
+    
+    # Set the selected window if specified
+    if 'focus' in config:
+        focus = config['focus']
+        if 'window' in focus:
+            if not run_tmux_command(f"tmux select-window -t {session_name}:{focus['window']}", debug):
+                return False
+        if 'pane' in focus:
+            if not run_tmux_command(f"tmux select-pane -t {session_name}:{focus['window']}.{focus['pane']}", debug):
+                return False
+    
+    return True
+
+def process_panes(session_name, window_name, panes, working_dir, debug=False):
+    """Process panes for a window"""
+    for i, pane in enumerate(panes):
+        if i == 0:  # First pane already exists
+            pane_target = f"{session_name}:{window_name}.0"
+        else:
+            # Get split direction
+            split_type = "-h"  # Default to horizontal split
+            if 'split' in pane:
+                if pane['split'].lower() in ['v', 'vertical']:
+                    split_type = "-v"
+                elif pane['split'].lower() in ['h', 'horizontal']:
+                    split_type = "-h"
+            
+            # Handle custom size if provided
+            size_option = ""
+            if 'size' in pane:
+                size_option = f" -p {pane['size']}"
+            
+            # Handle pane-specific directory
+            pane_dir = pane.get('directory')
+            if pane_dir:
+                pane_dir = expand_path(pane_dir, working_dir)
+            else:
+                pane_dir = working_dir
+            
+            # Create the pane
+            split_cmd = f"tmux split-window {split_type}{size_option} -t {session_name}:{window_name}"
+            if pane_dir:
+                split_cmd += f" -c {pane_dir}"
+            
+            if not run_tmux_command(split_cmd, debug):
+                return False
+            
+            pane_target = f"{session_name}:{window_name}.{i}"
+        
+        # Run command in pane if specified
+        if 'command' in pane:
+            cmd = pane['command']
+            if not run_tmux_command(f"tmux send-keys -t {pane_target} '{cmd}' C-m", debug):
+                return False
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    
+    # Check if we have multiple sessions defined
+    if 'sessions' in config:
+        # Multiple sessions mode
+        sessions_config = config['sessions']
+        
+        if args.session_index is not None:
+            # Create a specific session by index
+            if args.session_index < 0 or args.session_index >= len(sessions_config):
+                print(f"Error: Session index {args.session_index} is out of range. Config has {len(sessions_config)} sessions.", file=sys.stderr)
+                sys.exit(1)
+            
+            session_config = sessions_config[args.session_index]
+            session_name = args.session_name or session_config.get('session', f"session-{args.session_index}")
+            
+            if create_layout(session_config, session_name, args.debug):
+                print(f"Tmux session '{session_name}' created successfully.")
+                
+                if args.attach and not args.debug:
+                    # Attach to the session
+                    os.system(f"tmux attach-session -t {session_name}")
+            else:
+                print(f"Failed to create tmux session '{session_name}'.", file=sys.stderr)
+                sys.exit(1)
+                
+        elif args.all_sessions:
+            # Create all sessions
+            success_count = 0
+            
+            for i, session_config in enumerate(sessions_config):
+                session_name = session_config.get('session', f"session-{i}")
+                if create_layout(session_config, session_name, args.debug):
+                    print(f"Tmux session '{session_name}' created successfully.")
+                    success_count += 1
+                else:
+                    print(f"Failed to create tmux session '{session_name}'.", file=sys.stderr)
+            
+            print(f"Created {success_count} out of {len(sessions_config)} sessions.")
+            
+            if args.attach and success_count > 0 and not args.debug:
+                # Attach to the first successful session
+                first_session = sessions_config[0].get('session', "session-0")
+                os.system(f"tmux attach-session -t {first_session}")
+        
+        else:
+            # Default to first session if none specified
+            session_config = sessions_config[0]
+            session_name = args.session_name or session_config.get('session', "session-0")
+            
+            if create_layout(session_config, session_name, args.debug):
+                print(f"Tmux session '{session_name}' created successfully.")
+                print(f"Note: Your config has {len(sessions_config)} sessions defined. Use --all-sessions to create all or --session-index to specify which one.")
+                
+                if args.attach and not args.debug:
+                    # Attach to the session
+                    os.system(f"tmux attach-session -t {session_name}")
+            else:
+                print(f"Failed to create tmux session '{session_name}'.", file=sys.stderr)
+                sys.exit(1)
+    else:
+        # Single session mode (original behavior)
+        session_name = args.session_name or config.get('session', 'tmux-workspace')
+        
+        if create_layout(config, session_name, args.debug):
+            print(f"Tmux session '{session_name}' created successfully.")
+            
+            if args.attach and not args.debug:
+                # Attach to the session
+                os.system(f"tmux attach-session -t {session_name}")
+        else:
+            print(f"Failed to create tmux session '{session_name}'.", file=sys.stderr)
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
